@@ -1,23 +1,24 @@
 import os
 from obspy import UTCDateTime
-# import subprocess
 from subprocess import Popen, PIPE, run
 
 """
+Creates the phases folder if not found, then downloads all NCSS hypoinverse files which contain the phase picks.
+This is done by executing the following AWS CLI command: "aws s3 cp s3://ncedc-pds/event_phases ./phases --recursive --no-sign-request"
+Hypoinverse files are initially compressed, so they must be uncompressed using the command: "uncompress {file_name.Z}"
 """
 phases_root = './phases'
 def init():
     if not os.path.exists(phases_root):
+        print(f'Creating folder {phases_root}.')
         os.makedirs(phases_root)
-        # aws s3 cp s3://ncedc-pds/event_phases ./phases --recursive --no-sign-request
-        #subprocess.run(["aws", "s3", "cp", "s3://ncedc-pds/event_phases", phases_root, "--recursive", "--no-sign-request"], capture_output=True)
         with Popen(['aws', 's3', 'cp', 's3://ncedc-pds/event_phases', phases_root, '--recursive', '--no-sign-request'], stdout=PIPE) as p:
             while True:
                 text = p.stdout.read1().decode('utf-8')
                 print(text, end='', flush=True)
+                if p.poll() is not None:
+                    break
         for root, dirs, files in os.walk(phases_root):
-            if len(dirs) > 0:
-                continue
             for file in files:
                 if file.endswith('.Z'):
                     print(f'Uncompressing {os.path.join(root, file)}.')
@@ -51,9 +52,6 @@ def process_phase_file(dir, file):
     """ 
     pick_pairs = []
     for i in range(len(event_header_line_ids)-1):
-        both = False
-        pairmatch = False
-        
         p_picks = []
         s_picks = []
         already_found = set()
@@ -111,7 +109,6 @@ def process_phase_file(dir, file):
                 if (event_id, network, station) not in already_found:
                     already_found.add((event_id, network, station))
                     pick_pairs.append([event_id, network, station, p_dt_text, s_dt_text, '1']) # Value of 1 (i.e., True) indicates instrument match.
-                    both = True # ToDo: remove
             elif p:
                 p_picks.append([network, station, channel, p_dt_text])
             elif s:
@@ -127,7 +124,6 @@ def process_phase_file(dir, file):
                     already_found.add((event_id, s_pick[0], s_pick[1]))
                     pick_pairs.append([event_id, p_pick[0], p_pick[1], p_pick[3], s_pick[3], '1'])
                     p_match_found = True
-                    pairmatch = True
                     break
             # Try to find matching p pick recorded by different instrument.
             if not p_match_found:
@@ -135,11 +131,7 @@ def process_phase_file(dir, file):
                     if s_pick[0]==p_pick[0] and s_pick[1]==p_pick[1]:
                         already_found.add((event_id, s_pick[0], s_pick[1]))
                         pick_pairs.append([event_id, p_pick[0], p_pick[1], p_pick[3], s_pick[3], '0']) # Value of 0 (i.e., False) indicates different instrument.
-                        pairmatch = True
                         break
-    
-            if both and pairmatch:
-                print(f'BOTH! {file}: {event_id}')
 
     # Write pick sets to file.
     out_path = os.path.join(root, file.replace('phase', 'parsed.txt'))
@@ -157,8 +149,8 @@ for root, dirs, files in os.walk(phases_root):
     for file in files:
         if file.endswith('.txt'):
             continue
-        print(f'Processing file: {os.path.join(root, file)}. Processed so far: {processed_files}.')
+        print(f'Parsing file: {os.path.join(root, file)}. Parsed so far: {processed_files}.')
         process_phase_file(root, file)
         processed_files += 1
 
-print(f'Processed {processed_files} files.')
+print(f'Parsed {processed_files} files.')
