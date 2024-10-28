@@ -1,5 +1,27 @@
 import os
 from obspy import UTCDateTime
+# import subprocess
+from subprocess import Popen, PIPE, run
+
+"""
+"""
+phases_root = './phases'
+def init():
+    if not os.path.exists(phases_root):
+        os.makedirs(phases_root)
+        # aws s3 cp s3://ncedc-pds/event_phases ./phases --recursive --no-sign-request
+        #subprocess.run(["aws", "s3", "cp", "s3://ncedc-pds/event_phases", phases_root, "--recursive", "--no-sign-request"], capture_output=True)
+        with Popen(['aws', 's3', 'cp', 's3://ncedc-pds/event_phases', phases_root, '--recursive', '--no-sign-request'], stdout=PIPE) as p:
+            while True:
+                text = p.stdout.read1().decode('utf-8')
+                print(text, end='', flush=True)
+        for root, dirs, files in os.walk(phases_root):
+            if len(dirs) > 0:
+                continue
+            for file in files:
+                if file.endswith('.Z'):
+                    print(f'Uncompressing {os.path.join(root, file)}.')
+                    run(['uncompress', os.path.join(root, file)])
 
 def process_phase_file(dir, file):
     path = os.path.join(dir, file)
@@ -88,7 +110,7 @@ def process_phase_file(dir, file):
             if p and s:
                 if (event_id, network, station) not in already_found:
                     already_found.add((event_id, network, station))
-                    pick_pairs.append([event_id, network, station, p_dt_text, s_dt_text, '1']) # Value of 1 (e.g., True) indicates instrument match.
+                    pick_pairs.append([event_id, network, station, p_dt_text, s_dt_text, '1']) # Value of 1 (i.e., True) indicates instrument match.
                     both = True # ToDo: remove
             elif p:
                 p_picks.append([network, station, channel, p_dt_text])
@@ -112,7 +134,7 @@ def process_phase_file(dir, file):
                 for p_pick in p_picks:
                     if s_pick[0]==p_pick[0] and s_pick[1]==p_pick[1]:
                         already_found.add((event_id, s_pick[0], s_pick[1]))
-                        pick_pairs.append([event_id, p_pick[0], p_pick[1], p_pick[3], s_pick[3], '0']) # Value of 0 (e.g., False) indicates different instrument.
+                        pick_pairs.append([event_id, p_pick[0], p_pick[1], p_pick[3], s_pick[3], '0']) # Value of 0 (i.e., False) indicates different instrument.
                         pairmatch = True
                         break
     
@@ -125,9 +147,10 @@ def process_phase_file(dir, file):
         for pick_pair in pick_pairs:
             outfile.write('|'.join(pick_pair) + '\n')
            
-phases_root = './phases'
-processed_files = 0
 
+init()
+
+processed_files = 0
 for root, dirs, files in os.walk(phases_root):
     if len(dirs) > 0:
         continue
