@@ -3,18 +3,21 @@ from obspy import UTCDateTime, Stream
 import time
 import os
 import sqlite3
-import os
 import sys
-from threading import Thread
+from threading import Thread, current_thread
 from queue import Queue
 import queue
 import obspy
+import configparser
+
+config = configparser.ConfigParser()
+config.read('./config.ini')
 
 # Queues used for thread coordination.
 # ToDo: add more extensive comment, including about the DownloadWorker class.
 batch_queue = Queue()
 sql_queue = Queue()    # For sqlite writes.
-retry_queue = Queue()  # For sqlite writes.
+retry_queue = Queue()
 
 class DownloadWorker(Thread):
     def __init__(self, queue):
@@ -33,7 +36,10 @@ class DownloadWorker(Thread):
             except queue.Empty:
                 pass
 
-def log_message(message, log_path):
+
+def log_message(message):
+    thread = current_thread()
+    log_path = thread.log_path
     with(open(log_path, 'a')) as logfile:
         logfile.write(f'{message}\n\n')
 
@@ -76,12 +82,9 @@ if create_singleton_db:
 
 """
 Create obspy client to download waveforms from NCEDC dataselect web service (https://service.ncedc.org/fdsnws/dataselect/1/).
-Rather than querying the NCEDC station web service (https://service.ncedc.org/fdsnws/station/1/) for available instruments at each station, simply request everything of interest.
-See https://ds.iris.edu/ds/nodes/dmc/data/formats/seed-channel-naming/ for channel naming conventions.
+
 """
 client = Client("NCEDC")
-bands = ['D', 'E', 'S', 'H', 'B']
-instruments = ['H', 'L', 'N', 'P'] # Removed G, M
 
 """
 Traces returned from NCEDC are labeled only by network, station, and start/end times. Based on these values, this function finds the matching
@@ -89,7 +92,7 @@ phase data, including p and s pick times, associated a trace.
 When matching incomplete traces (e.g., those shorter than expected), a tolerance is allowed for start time to account for the missing data.
 Any phase data that cannot be matched with a trace is logged to a retry file for further investigation.
 """
-def get_matching_phase_data(trace, phase_data, matched_phase_data, log_path):
+def get_matching_metadata(trace, metadata, matched_metadata):
     tr_network = trace.stats.network
     tr_station = trace.stats.station
     tr_start = trace.stats.starttime
@@ -108,7 +111,7 @@ def get_matching_phase_data(trace, phase_data, matched_phase_data, log_path):
         if len(match_idxs) == 0:
             message = 'Zero phase data matches found for trace:\n'
             message += str(trace)
-            log_message(message, log_path)
+            thread_log_message(message)
             return 0
     
     if len(match_idxs) > 1: 
@@ -117,21 +120,22 @@ def get_matching_phase_data(trace, phase_data, matched_phase_data, log_path):
         message += 'Matches:\n'
         for match_idx in match_idxs:
             message += str(phase_data[match_idx]) + '\n'
-        log_message(message, log_path)
+        thread_log_message(message)
         return 0
     else:
         matched_phase_data[match_idxs[0]] = 1
         return phase_data[match_idxs[0]]
 
-def write_Z_stream(stream, phase_data, matched_phase_data, log_path):
+# ToDo: Only one write function?
+def write_Z_stream(stream, phase_data, matched_phase_data):
     message = "Attempting to write all-Z stream:\n"
     message += "(Note that some traces may not be written if they cannot be matched with phase data.)\n"
     message += stream.__str__(extended=True)
-    log_message(message, log_path)
+    log_message(message)
 
     for trace in stream:
         complete = len(trace) == 60 * trace.stats.sampling_rate
-        phase_row = get_matching_phase_data(trace, phase_data, matched_phase_data, log_path)
+        phase_row = get_matching_metadata(trace, phase_data, matched_phase_data)
         if phase_row == 0: # Zero or multiple phase data matches.
             continue
         singleton_stream = Stream(trace)
@@ -142,7 +146,7 @@ def write_Z_stream(stream, phase_data, matched_phase_data, log_path):
                                 'location': trace.stats.location, 'channel': trace.stats.channel, 'P': phase_row['p_text'], 'S': phase_row['s_text'], 
                                 'inst_match': phase_row['inst_match'], 'complete': int(complete), 'file': file, 'waveform_path': waveform_path, 'n_components': 1})
 
-def write_ENZ_streams(streams, phase_data, matched_phase_data, log_path):
+def write_ENZ_streams(streams, metadata, matched_phase_data):
     for stream in streams:
         complete = True
         longest_trace = stream[0]
@@ -151,13 +155,13 @@ def write_ENZ_streams(streams, phase_data, matched_phase_data, log_path):
                 complete = False
             if len(trace) > len(longest_trace):
                 longest_trace = trace
-        phase_row = get_matching_phase_data(longest_trace, phase_data, matched_phase_data, log_path)
+        phase_row = get_matching_metadata(longest_trace, metadata, matched_phase_data)
         if phase_row == 0: # Zero or multiple phase data matches.
             continue
 
         message = "Writing E/N/Z set:\n"
         message += stream.__str__(extended=True)
-        log_message(message, log_path)
+        log_message(message)
         
         waveform_path = f'{dir_path_3comp}/{phase_row["event_id"]}.{longest_trace.stats.network}.{longest_trace.stats.station}' \
                         f'.{longest_trace.stats.location}.{longest_trace.stats.channel[:2]}.mseed'
@@ -166,69 +170,95 @@ def write_ENZ_streams(streams, phase_data, matched_phase_data, log_path):
                           'location': trace.stats.location, 'channel': trace.stats.channel[:2], 'P': phase_row['p_text'], 'S': phase_row['s_text'], 
                           'inst_match': phase_row['inst_match'], 'complete': int(complete), 'file': file, 'waveform_path': waveform_path, 'n_components': 3})
 
-# Lines from parsed hypoinverse files.
-lines = []
+
+"""
+Build bulk query to retrieve 60 second waveforms centered on the midpoint between the p and s picks.
+30 second randomly-positioned waveforms containing both picks are required to train PhaseNet, but retrieving 60 second waveforms
+with consistent centering potentially increases the applications of the produced dataset.
+As mentioned previously, data from all bands and instruments of interest are requested rather than determining a station's available instruments.
+"""
+def build_bulk_query(batch):
+    metadata = []
+    bulk_query = ''
+    for line_id, line in enumerate(batch):
+        tokens = line.split('|')
+        event_id = tokens[0]
+        network = tokens[1]
+        station = tokens[2]
+        p_text = tokens[3]
+        p_dt = UTCDateTime(p_text)
+        s_text = tokens[4]
+        s_dt = UTCDateTime(s_text)
+        instrument_match = int(tokens[5])
+        
+        dt_mid = p_dt + (s_dt - p_dt)/2
+        dt_start = dt_mid - 30
+        dt_end = dt_mid + 30
+
+        for band in config['DOWNLOAD_WAVEFORMS']['bands_of_interest'].split(','):
+            for instrument in config['DOWNLOAD_WAVEFORMS']['instruments_of_interest'].split(','):
+                bulk_query += f'{network} {station} * {band}{instrument}* {dt_start} {dt_end}\n'
+
+        # We need a dictionary of the metadata used to construct the bulk query in order to associate the returned waveforms with p and s pick times, etc.
+        # ToDo: move this comment above ^
+        metadata.append({'event_id': event_id, 'network': network, 'station': station, 'start': dt_start, 
+                         'p_text': p_text, 's_text': s_text, 'p_dt': p_dt, 's_dt': s_dt, 'inst_match': instrument_match, 'line_id': line_id})
+
+    return bulk_query, metadata
+
+# ToDo: comment about safe assumption.
+def group_by_station_instrument(stream):
+    group_start_trace_ids = []
+    first_trace_in_group = stream[0]
+    group_start_trace_ids.append(0)
+    for i, cur_trace in enumerate(stream):
+            network_match = (first_trace_in_group.stats.network == cur_trace.stats.network)
+            station_match = (first_trace_in_group.stats.station == cur_trace.stats.station)
+            instrument_match = (first_trace_in_group.stats.channel[:2] == cur_trace.stats.channel[:2])
+            if (not network_match) or (not station_match) or (not instrument_match):
+                group_start_trace_ids.append(i)
+                first_trace_in_group = cur_trace
+    if group_start_trace_ids[-1] != len(stream):
+        group_start_trace_ids.append(len(stream))
+
+    # ToDo: remove this later
+    message = 'Group start trace ids:\n'
+    message += ','.join(str(id) for id in group_start_trace_ids)
+    log_message(message)
+
+    return group_start_trace_ids
 
 """
 Process one batch of lines from a parsed hypoinverse file.
 All waveforms associated with the batch are downloaded from the NCEDC dataselect web service via a single bulk request to reduce overhead.
 Testing so far indicates that a batch size of 100 is safe (requests will succeed before timing out).
 """
-def process_lines(file, log_path, batch_start, batch_end):
+def process_lines(file, batch_start, batch_end): # ToDo: process_batch? Remove file, add as thread property?
     unconsumed_traces = Stream()
 
     batch = lines[batch_start:batch_end]
 
     # Tracks any phase data that cannot be associated with returned trace(s) from NCEDC. A zero value indicates unmatched data.
-    matched_phase_data = [0] * len(batch)
+    is_metadata_matched = [0] * len(batch)
 
-    log_message(f'Processing lines. File: {file}, line ids (n={len(batch)}): {batch_start}-{batch_end}.', log_path)
+    log_message(f'Processing lines. File: {file}, line ids (n={len(batch)}): {batch_start}-{batch_end}.')
 
-    bulk = ''
-    phase_data = []
-    for line_id, line in enumerate(batch):
-        split = line.split('|')
-        event_id = split[0]
-        network = split[1]
-        station = split[2]
-        p_text = split[3]
-        p_dt = UTCDateTime(p_text)
-        s_text = split[4]
-        s_dt = UTCDateTime(s_text)
-        instrument_match = int(split[5])
-        dt_mid = p_dt + (s_dt - p_dt)/2
-
-        """
-        Retrieve 60 second waveforms centered on the midpoint between the p and s picks.
-        30 second randomly-positioned waveforms containing both picks are required to train PhaseNet, but retrieving 60 second waveforms
-        with consistent centering potentially increases the applications of the produced dataset.
-        As mentioned previously, data from all bands and instruments of interest are requested rather than determining a station's available instruments.
-        """
-        dt_start = dt_mid - 30
-        dt_end = dt_mid + 30
-
-        for band in bands:
-            for instrument in instruments:
-                bulk += f'{network} {station} * {band}{instrument}* {dt_start} {dt_end}\n'
-
-        # We need a dictionary of the phase data used to construct the bulk query in order to associate the returned waveforms with p and s pick times, etc.
-        phase_data.append({'event_id': event_id, 'network': network, 'station': station, 'start': dt_start, 
-                           'p_text': p_text, 's_text': s_text, 'p_dt': p_dt, 's_dt': s_dt, 'inst_match': instrument_match, 'line_id': line_id})
+    bulk_query, metadata = build_bulk_query(batch)
 
     # Bulk request to NCEDC dataselect web service.
     try:
-        stream = client.get_waveforms_bulk(bulk)
+        stream = client.get_waveforms_bulk(bulk_query)
     except obspy.clients.fdsn.header.FDSNNoDataException:
         message = 'No data available for batch:\n'
         message += '\n'.join(lines)
-        log_message(message, log_path)
+        log_message(message)
         return
-
 
     message = 'Downloaded stream.\n'
     message += stream.__str__(extended=True)
-    log_message(message, log_path)
+    log_message(message)
 
+    # Remove all "very" incomplete traces (i.e., those shorter than 80% expected length)
     incomplete_traces = Stream()
     for trace in stream:
         tr_expected_length = 60 * trace.stats.sampling_rate
@@ -239,118 +269,105 @@ def process_lines(file, log_path, batch_start, batch_end):
     if len(incomplete_traces) > 0:
         message = "The following traces were removed because they were < 80% expected length:\n"
         message += incomplete_traces.__str__(extended=True)
-        log_message(message, log_path)
+        log_message(message)
 
-    n_traces = len(stream)
-    i = 0
-    while i<n_traces:
-        """
-        Get all traces from the next "chunk."
-        A chunk consists of all traces returned from a single station and instrument.
-        """
-        first_trace = stream[i]
-        cur_stream = Stream(traces=[first_trace])
-        while True:
-            i += 1
-            if i == n_traces:
-                break
+    # Group the stream retrieved from NCEDC by station and instrument.
+    group_start_trace_ids = group_by_station_instrument(stream)
 
-            next_trace = stream[i]
-            network_match = (cur_stream[0].stats.network == next_trace.stats.network)
-            station_match = (cur_stream[0].stats.station == next_trace.stats.station)
-            instrument_match = (cur_stream[0].stats.channel[:2] == next_trace.stats.channel[:2])
+    for group_num in range(len(group_start_trace_ids)-1):
+        group = stream[group_start_trace_ids[group_num]:group_start_trace_ids[group_num+1]]
 
-            # ToDo: add note about assumption.
-            if (not network_match) or (not station_match) or (not instrument_match):
-                break
+        # ToDo: remove later.
+        message = f'Group {group_num}:'
+        message += group.__str__(extended=True)
+        log_message(message)
 
-            cur_stream.append(next_trace)
-        
         """
-        Segment the current chunk into E/N/Z sets, Z singletons, and "leftovers" (e.g., E/N traces without a matching Z trace).
+        Segment the current group into E/N/Z sets, Z singletons, and "leftovers" (i.e., E/N traces without a matching Z trace).
         """
-        allZ = True
-        for trace in cur_stream:
+        all_Z = True
+        for trace in group:
             if trace.stats.channel[-1] != 'Z' and trace.stats.channel[-1] != '3':
-                allZ = False
+                all_Z = False
                 break
-
-        if allZ:
-                write_Z_stream(cur_stream, phase_data, matched_phase_data, log_path)
+        
+        if all_Z:
+            write_Z_stream(group, metadata, matched_metadata)
         else:
             # This is O(n^2), but total computation time is still much smaller than waiting for the data to come back from NCEDC.
             # So not worth the effort to optimize it.
-            consumed_trace_idxs = [0] * len(cur_stream)
+            # Strategy - i loop finds E/1, j loop iterates through group again to find matching N/Zs. This is n^2, but...
+            # Add note about consumed_trace_ids
+            is_trace_consumed = [0] * len(group)
             streams_3comp = []
-            # This nested loop = O(n^2)
             idx_E = -1
             idx_NZ = []
-            for j, tracej in enumerate(cur_stream):
-                if tracej.stats.channel[-1] == 'E' or tracej.stats.channel[-1] == '1':
-                    idx_E = j
-                    expected_trace_length = 60 * tracej.stats.sampling_rate
-                    length_error_E = expected_trace_length - len(tracej)
-                    for k, tracek in enumerate(cur_stream):
-                        length_error_cur = expected_trace_length - len(tracek)
+            for i, trace_i in enumerate(group):
+                if trace_i.stats.channel[-1] == 'E' or trace_i.stats.channel[-1] == '1':
+                    idx_E = i
+                    expected_trace_length = 60 * trace_i.stats.sampling_rate
+                    length_error_E = expected_trace_length - len(trace_i)
+                    for j, trace_j in enumerate(group):
+                        length_error_cur = expected_trace_length - len(trace_j)
                         length_error_max = max(length_error_E, length_error_cur)
                         # Already know everything in the chunk has same network, station, and instrument.
                         # So just need to check location and start time here.
                         # length_error_max/sampling rate = seconds, 0.1 to account for misalignment...
                         # discuss tolerance.. same as previously described.
-                        if (j != k
-                            and tracek.stats.location == tracej.stats.location 
-                            and abs(tracek.stats.starttime - tracej.stats.starttime) < length_error_max/tracej.stats.sampling_rate + 0.1):
-                            idx_NZ.append(k)
+                        if (i != j
+                            and trace_j.stats.location == trace_i.stats.location 
+                            and abs(trace_j.stats.starttime - trace_i.stats.starttime) < length_error_max/trace_i.stats.sampling_rate + 0.1):
+                            idx_NZ.append(j)
                     if len(idx_NZ)==2:
-                        traces = [cur_stream[idx_E], cur_stream[idx_NZ[0]], cur_stream[idx_NZ[1]]]
+                        traces = [group[idx_E], group[idx_NZ[0]], group[idx_NZ[1]]]
                         streams_3comp.append(Stream(traces=traces))
-                        consumed_trace_idxs[idx_E] = 1
-                        consumed_trace_idxs[idx_NZ[0]] = 1
-                        consumed_trace_idxs[idx_NZ[1]] = 1
+                        is_trace_consumed[idx_E] = 1
+                        is_trace_consumed[idx_NZ[0]] = 1
+                        is_trace_consumed[idx_NZ[1]] = 1
                     else:
                         log_stream = Stream()
-                        log_stream.append(cur_stream[idx_E])
+                        log_stream.append(group[idx_E])
                         for trace_id in idx_NZ:
-                            log_stream.append(cur_stream[trace_id])
+                            log_stream.append(group[trace_id])
                 
                         message = 'Incomplete set, or set with too many components:\n'
                         message += log_stream.__str__(extended=True)
-                        log_message(message, log_path)
+                        log_message(message)
                     idx_NZ = []
                     
-            # Write E/N/Z sets
-            if len(streams_3comp) > 0:
-                write_ENZ_streams(streams_3comp, phase_data, matched_phase_data, log_path)
+        # Write E/N/Z sets
+        if len(streams_3comp) > 0:
+            write_ENZ_streams(streams_3comp, metadata, matched_phase_data)
 
-            # Write extra, "trailing" Z singletons
-            stream_z = Stream()
-            for j, trace in enumerate(cur_stream):
-                if consumed_trace_idxs[j] == 0 and (trace.stats.channel[-1] == 'Z' or trace.stats.channel[-1] == '3'):
-                    consumed_trace_idxs[j] = 1
-                    stream_z.append(trace)
-            if len(stream_z) > 0:
-                write_Z_stream(stream_z, phase_data, matched_phase_data, log_path)
+        # Write extra, "trailing" Z singletons
+        stream_z = Stream()
+        for i, trace in enumerate(group):
+            if is_trace_consumed[i] == 0 and (trace.stats.channel[-1] == 'Z' or trace.stats.channel[-1] == '3'):
+                is_trace_consumed[i] = 1
+                stream_z.append(trace)
+        if len(stream_z) > 0:
+            write_Z_stream(stream_z, metadata, matched_metadata)
+        
+        for i, val in enumerate(is_trace_consumed):
+            if val == 0:
+                unconsumed_traces.append(group[i])
             
-            for j, val in enumerate(consumed_trace_idxs):
-                if val == 0:
-                    unconsumed_traces.append(cur_stream[j])
-            
-    """
-    Log traces that could not be associated with an E/N/Z set.
-    This should not contain any Z traces, since these are written as singletons.
-    """
-    if len(unconsumed_traces) > 0:
-        message = 'Unconsumed traces:\n'
-        message += unconsumed_traces.__str__(extended=True)
-        log_message(message, log_path)
+        """
+        Log traces that could not be associated with an E/N/Z set.
+        This should not contain any Z traces, since these are written as singletons.
+        """
+        if len(unconsumed_traces) > 0:
+            message = 'Unconsumed traces:\n'
+            message += unconsumed_traces.__str__(extended=True)
+            log_message(message)
 
-    """
-    Log any phase data which could not be matched to waveforms.
-    These can be retried later, perhaps with different window start and end times.
-    """
-    for i in range(len(matched_phase_data)):
-        if matched_phase_data[i] == 0:
-            retry_queue.put(phase_data[i]['line_id'])
+    # """
+    # Log any phase data which could not be matched to waveforms.
+    # These can be retried later, perhaps with different window start and end times.
+    # """
+    # for i in range(len(matched_phase_data)):
+    #     if matched_phase_data[i] == 0:
+    #         retry_queue.put(phase_data[i]['line_id'])
 
 # --------------- PROGRAM START ------------------------
 

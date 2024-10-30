@@ -1,0 +1,9 @@
+*
+!.gitignore
+!config.ini
+!parse_phases.py
+!download_waveforms.py
+!check_waveforms.py
+!build_hdf5.py
+!test_hdf5.py
+!pytorch_hdf5_dataset.py

@@ -7,8 +7,7 @@ Creates the phases folder if not found, then downloads all NCSS hypoinverse file
 This is done by executing the following AWS CLI command: "aws s3 cp s3://ncedc-pds/event_phases ./phases --recursive --no-sign-request"
 Hypoinverse files are initially compressed, so they must be uncompressed using the command: "uncompress {file_name.Z}"
 """
-phases_root = './phases'
-def init():
+def init(phases_root):
     if not os.path.exists(phases_root):
         print(f'Creating folder {phases_root}.')
         os.makedirs(phases_root)
@@ -24,7 +23,7 @@ def init():
                     print(f'Uncompressing {os.path.join(root, file)}.')
                     run(['uncompress', os.path.join(root, file)])
 
-def process_phase_file(dir, file):
+def parse_phase_file(dir, file):
     path = os.path.join(dir, file)
     lines = []
     event_header_line_ids = []
@@ -70,7 +69,7 @@ def process_phase_file(dir, file):
             A single line can represent both a p and s pick.
             Duplicate (event_id, network, station) pick sets are rejected.
             The values for p and s seconds represent offsets from a shared datetime (down to the minute). These values can
-            exceed 6000 (e.g., 60.00 sec) or be negative.
+            exceed 6000 (i.e., 60.00 sec) or be negative.
             """
             p = (line[14] == 'P')
             if p:
@@ -139,18 +138,21 @@ def process_phase_file(dir, file):
         for pick_pair in pick_pairs:
             outfile.write('|'.join(pick_pair) + '\n')
            
+# -------------------------------- PROGRAM START --------------------------------
 
-init()
+phases_root = './phases'
 
-processed_files = 0
+init(phases_root)
+
+parsed_files = 0
 for root, dirs, files in os.walk(phases_root):
     if len(dirs) > 0:
         continue
     for file in files:
         if file.endswith('.txt'):
             continue
-        print(f'Parsing file: {os.path.join(root, file)}. Parsed so far: {processed_files}.')
-        process_phase_file(root, file)
-        processed_files += 1
+        print(f'Parsing file: {os.path.join(root, file)}. Parsed so far: {parsed_files}.')
+        parse_phase_file(root, file)
+        parsed_files += 1
 
-print(f'Parsed {processed_files} files.')
+print(f'Parsed {parsed_files} files.')
